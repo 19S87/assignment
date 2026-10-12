@@ -36,6 +36,14 @@ AGENT_ROLE_NAMES = {
     for n in os.getenv("AGENT_ROLE_NAMES", "Agent").split(",")
     if n.strip()
 }
+# OPTIONAL filter, off by default. If set (e.g. "full,change"), members whose
+# *direct* group access has none of these levels are skipped. Leave unset if
+# agents get access through roles or parent groups: that isn't visible here.
+OWNER_ACCESS = {
+    a.strip().lower()
+    for a in os.getenv("OWNER_GROUP_ACCESS", "").split(",")
+    if a.strip()
+}
 # Zammad's "-" system user (tickets with no owner have owner_id == 1).
 UNASSIGNED_OWNER_ID = int(os.getenv("ZAMMAD_UNASSIGNED_OWNER_ID", "1"))
 
@@ -210,16 +218,45 @@ def _is_out_of_office(user: dict) -> bool:
     return True
 
 
-def _is_assignable(user: dict) -> bool:
-    if not user.get("active"):
+_warned: set = set()
+
+
+def _lacks_owner_access(user: dict, group_id: int) -> bool:
+    """
+    True when Zammad lists this user's access to the group and it is too low to
+    own tickets (e.g. only ["overview", "read"]). Zammad silently ignores an
+    owner change to such a user: HTTP 200, owner_id unchanged.
+
+    Access granted through a role (not listed per user) can't be seen here, so
+    those users are kept; the failover loop handles any that Zammad refuses.
+    """
+    if not OWNER_ACCESS:
+        return False  # opt-in only: the user object doesn't show role/inherited access
+    access = (user.get("group_ids") or {}).get(str(group_id))
+    if access is None:
         return False
+    return not (set(access) & OWNER_ACCESS)
+
+
+def _exclusion_reason(user: dict, group_id: int):
+    """None if the user can be assigned tickets, else a short reason."""
+    if _lacks_owner_access(user, group_id):
+        return f"direct group access {sorted(user['group_ids'][str(group_id)])} has none of {sorted(OWNER_ACCESS)}"
+    if not user.get("active"):
+        return "inactive"
     roles = user.get("roles")  # present because we request expand=true
     if roles is not None:
         if not ({str(r).lower() for r in roles} & AGENT_ROLE_NAMES):
-            return False  # e.g. customer-only users are group members too
+            return f"no agent role (roles={roles})"
     elif not user.get("role_ids"):
-        return False
-    return not _is_out_of_office(user)
+        return "no roles"
+    if _is_out_of_office(user):
+        return "out of office"
+    return None
+
+
+def _is_assignable(user: dict, group_id: int) -> bool:
+    return _exclusion_reason(user, group_id) is None
 
 
 _cache: dict = {}
@@ -261,7 +298,23 @@ def get_group_agents(group_id: int) -> list:
     for err in auth_errors:
         log.warning("skipping a group member the token may not read: %s", err)
 
-    agents = [u for u in results if isinstance(u, dict) and _is_assignable(u)]
+    agents, excluded = [], {}
+    for u in results:
+        if not isinstance(u, dict):
+            continue
+        reason = _exclusion_reason(u, group_id)
+        if reason is None:
+            agents.append(u)
+        else:
+            excluded[u.get("id")] = reason
+    # Zammad's group.user_ids lists only members with *direct* access; agents who
+    # get access through a role or a parent group are not in it.
+    log.info(
+        "group=%s direct members=%d eligible=%s excluded=%s",
+        group_id, len(user_ids), [a["id"] for a in agents], excluded,
+    )
+    if not agents:
+        log.error("group=%s: none of the %d direct member(s) is assignable", group_id, len(user_ids))
     if agents:
         with _cache_lock:
             _cache[group_id] = (now, agents)
