@@ -26,7 +26,7 @@ Zammad does not provide round-robin ticket assignment for groups out of the box.
 
 - Assigns tickets evenly across eligible agents of a group, in agent-id order
 - Stores one cursor per group in a local SQLite database (no Redis needed)
-- Skips users who are inactive, have no agent role, or are currently out of office
+- Picks the agents of each group from the roles you pin in `GROUP_ROLES` (for example `IT L1 Application Agent` for group 46), so no role named "Agent" is required; groups without an entry use their direct members. It skips inactive users, users out of office, and users whose roles lack the `ticket.agent` permission
 - Fails fast and loudly when Zammad rejects the API token, instead of retrying for minutes
 - Periodically sweeps for new tickets that were missed (for example during a Zammad outage)
 
@@ -63,9 +63,11 @@ Create a `.env` file:
 ZAMMAD_URL=https://your-zammad-domain
 ZAMMAD_API_TOKEN=your_api_token_here
 HMAC_SECRET=your_hmac_secret_here
+GROUP_ROLES={"46":[10]}
 ```
 
 Notes:
+- `GROUP_ROLES` maps a Zammad group id to the role id(s) whose holders receive that group's tickets (here group 46 -> role 10 "IT L1 Application Agent"). Use ids in `.env` files; they avoid quoting problems with role names.
 - `HMAC_SECRET` must match the secret configured in the Zammad webhook.
 - Instead of `ZAMMAD_API_TOKEN` you can set `ZAMMAD_API_TOKEN_FILE=/run/secrets/zammad_token`. The file is re-read on every request, so rotating the token does not require a restart.
 
@@ -107,8 +109,10 @@ docker compose -f docker-compose.yml -f scenarios/add-assignment.yml up -d
 | `ZAMMAD_MAX_ATTEMPTS` | `3` | Attempts for transient errors |
 | `ZAMMAD_BACKOFF_SECONDS` | `1` | First backoff, doubles each attempt |
 | `AGENT_CACHE_TTL_SECONDS` | `60` | How long a group's agent list is cached |
-| `AGENT_ROLE_NAMES` | `Agent` | Comma-separated role names that count as agents |
-| `OWNER_GROUP_ACCESS` | unset (off) | Optional: skip members whose *direct* group access has none of these levels (e.g. `full,change`). Leave unset if agents get access via roles or parent groups |
+| `GROUP_ROLES` | unset | JSON mapping group id to roles (ids or names), e.g. `{"46": [10], "47": ["IT L1 BI & Reporting Agent"]}`. For a listed group the pool is exactly the holders of those roles; unlisted groups use their direct members |
+| `ROLE_CACHE_TTL_SECONDS` | `300` | How long roles/permissions are cached |
+| `USERS_PER_PAGE` | `200` | Page size when listing users |
+| `OWNER_GROUP_ACCESS` | unset (off) | Optional, e.g. `full,change`: skip pinned-role holders whose role/user group access (when exposed by the API) has none of these levels |
 | `SWEEP_INTERVAL_SECONDS` | `300` | Sweeper period; `0` disables it |
 | `SWEEP_MIN_AGE_SECONDS` | `60` | Sweeper ignores tickets younger than this |
 | `SWEEP_QUERY` | `state.name:new AND owner_id:1` | Zammad search used by the sweeper |
@@ -147,7 +151,9 @@ Execute
 
 ## Behavior & Security
 
-- Eligible agents are active members of the group that hold an agent role (`AGENT_ROLE_NAMES`) and are not currently out of office (dates compared in the server's timezone).
+- Eligible agents for a group are the active holders of the roles pinned for it in `GROUP_ROLES` who have a role with the `ticket.agent` permission and are not currently out of office (dates compared in the server's timezone). Each group can have its own roles; no default "Agent" role is needed.
+- Roles are **not** guessed from their group permissions: in many Zammad setups every IT role (L2, L3, admins, other teams) has permissions on every IT group, which would spread tickets over the wrong people.
+- To use role **names** and to verify `ticket.agent`, the token user must be able to read roles and permissions (`GET /api/v1/roles`, `/api/v1/permissions`, an admin-level right). If it can't, use role **ids** in `GROUP_ROLES` (names then cannot be resolved and the pool is empty, which is logged).
 - Before assigning, the service checks that the ticket still has no owner, so repeated webhook deliveries are harmless.
 - Zammad's response to the owner update is used to confirm the assignment; no second request is made.
 - Error handling: 401/403 from Zammad abort immediately with HTTP 502; network errors/429/5xx are retried with backoff and end as HTTP 503; a refusal for one agent (4xx such as 422) moves on to the next agent.
@@ -169,7 +175,7 @@ The only state is one row per group (`last_user_id`) in SQLite at `RR_DB_PATH` (
 - **Tickets stop being assigned / `/health` returns 503 with `ZammadAuthError`**: the token is rejected. Check Zammad → Profile → Token Access for an expiry date, that the token's user is still active, and that it still has the needed permissions. Create a new token, update `ZAMMAD_API_TOKEN` (or the token file) and recreate the container.
 - **`/health` returns 503 with `ZammadTransientError`**: Zammad is unreachable or erroring; check `ZAMMAD_URL`, DNS and Zammad's own health.
 - **HMAC validation failures (401)**: the webhook secret in Zammad must equal `HMAC_SECRET`.
-- **"No assignable agents found for group"**: the log line `group=N direct members=... eligible=[...] excluded={id: reason}` shows who was considered and why each was dropped. Note that Zammad's group member list only contains users with *direct* access; agents who reach the group through a role or a parent group are not in it.
+- **"No assignable agents found for group"**: the log line `group=N roles={id: name} direct_members=... eligible=[...] excluded={id: reason}` shows who was considered and why each was dropped. If a pinned role's holders are missing, check that the role id/name in `GROUP_ROLES` is correct, the users are active, and (for names) that the token user may read roles.
 - **Uneven distribution after a restart**: make sure `/data` is a persistent volume.
 - **Sweeper assigns nothing**: the default `SWEEP_QUERY` is validated against Zammad's search syntax at runtime; check the logs for search errors and adjust `SWEEP_QUERY` for your Zammad version if needed.
 
