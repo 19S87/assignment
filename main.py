@@ -106,11 +106,21 @@ def _assign(ticket_id: int, group_id: int, source: str, ticket: dict | None = No
         # cannot fix them and would only prolong the outage.
 
         if updated.get("owner_id") != agent_id:
+            # Don't trust the PUT echo alone: confirm with a fresh GET, as the
+            # original code did, and log both values to show which one is wrong.
+            fresh = zammad.get_ticket(ticket_id)
+            if fresh.get("owner_id") != agent_id:
+                log.warning(
+                    "ticket=%s agent=%s not applied: PUT owner_id=%s, GET owner_id=%s, "
+                    "state_id=%s, trying next",
+                    ticket_id, agent_id, updated.get("owner_id"),
+                    fresh.get("owner_id"), fresh.get("state_id"),
+                )
+                continue
             log.warning(
-                "ticket=%s agent=%s: Zammad returned owner_id=%s, trying next",
+                "ticket=%s agent=%s: PUT response was stale (owner_id=%s) but GET confirms the assignment",
                 ticket_id, agent_id, updated.get("owner_id"),
             )
-            continue
 
         if agent_id != first:
             set_last_user(group_id, agent_id)  # keep cursor on who really got it
